@@ -179,7 +179,7 @@ class forwardSolver(life_path):
     
 
 
-class backwardSolver(life_path):
+class backwardSolver_CARA(life_path):
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
@@ -211,7 +211,8 @@ class backwardSolver(life_path):
         
         diff = u_prime_c - self.interest_rate*self.bequest_motive*u_prime_w
 
-        return diff**2
+        return diff**0.1
+    
     
     def solve_last_period(self,income_last):
 
@@ -222,7 +223,7 @@ class backwardSolver(life_path):
         
         w_grid = self.w_grid + max(0,self.consumption_floor - income_last)
 
-        for w in w_grid:
+        for w in w_grid:         
             obj = lambda c: self.last_period_obj(c,w,income_last)
             x0 = 1.0
             bounds = [(self.consumption_floor, w+income_last)]
@@ -240,6 +241,7 @@ class backwardSolver(life_path):
 
             self.approx_consume_func[f'age_{self.death_age}']['wealth'] += [w]
             self.approx_consume_func[f'age_{self.death_age}']['consumption'] += [c]
+     
 
     def interpolate_consume(self,t,w):
 
@@ -250,6 +252,7 @@ class backwardSolver(life_path):
         cs = CubicSpline(x=approx_func['wealth'], y=approx_func['consumption'])
 
         return cs(w)
+    
         
     def approx_bequest(self,t,w,new_income_process):
 
@@ -310,7 +313,7 @@ class backwardSolver(life_path):
 
         diff = tmp_now - tmp_next
 
-        return diff**2
+        return diff**0.1
 
     
     def consume_func_now(self,t,new_income_process):
@@ -369,7 +372,7 @@ class backwardSolver(life_path):
 
         self.life_path = {'wealth':[self.init_wealth],
                           'consumption':[float(init_c)],
-                          'income':self.income_process}
+                          'income':list(self.income_process)}
         
         for t in range(1,self.death_age+1):
             w = self.interest_rate*(self.life_path['wealth'][-1] - self.life_path['consumption'][-1] + self.income_process[t-1])
@@ -378,7 +381,191 @@ class backwardSolver(life_path):
             self.life_path['consumption'] += [float(c)]
         
 
+
+
+class backwardSolver_CRRA(life_path):
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+
+        if not hasattr(self, 'approx_consume_func'):
+            self.approx_consume_func = {f'age_{t}':{} for t in range(self.death_age+1)}
+
+    
+    def initialize(self,init_wealth,income_process):
+
+        # set grid points for wealth
+
+        _step = self.maxGrid / self.nGrid
+        _stop = _step*self.nGrid
+
+        self.init_income = income_process[0]
+        self.relative_income = income_process/self.init_income
+        self.init_wealth = init_wealth
+        self.w_grid = np.arange(_step,_stop,_step)*init_wealth/self.init_income
+        
+
+    def last_period_consume_func(self,w):
+
+        _coef = 1/(1+(self.bequest_motive*self.interest_rate**(1-self.risk_coef))**(1/self.risk_coef))
+        
+        return _coef*(w + self.relative_income[-1])
+    
+    def solve_last_period(self):
+
+        # Solve optimal consumption at each wealth level for the final period
+
+        self.approx_consume_func[f'age_{self.death_age}'] = {'wealth':[],
+                                                        'consumption':[]}
+        
+        w_grid = self.w_grid + max(0,self.consumption_floor/self.init_income - self.relative_income[-1])
+
+        for w in w_grid:
+            c = self.last_period_consume_func(w,self.relative_income[-1])
+
+            self.approx_consume_func[f'age_{self.death_age}']['wealth'] += [w]
+            self.approx_consume_func[f'age_{self.death_age}']['consumption'] += [c]
+     
+
+    def interpolate_consume(self,t,w):
+
+        # Interpolate consumption to create an approx consumption function
+
+        if t == self.death_age:
+            c = self.last_period_consume_func(w)
+
+        else:
+            approx_func = self.approx_consume_func[f'age_{t}']     
+            cs = CubicSpline(x=approx_func['wealth'], y=approx_func['consumption'])
+            c = cs(w)
+        
+        return c
+    
+        
+    def approx_bequest(self,t,w):
+
+        # calculate the approx bequest at period t
+        # w: wealth at period t
+        # new_income_process: income from t to the end
+
+        new_income_process = self.relative_income[t:]
+        wealth_now = w
+        income_now = new_income_process[0]
+        consume_now = self.interpolate_consume(t,w)
+
+        for age in range(t+1,self.death_age+1):
+            wealth_now = self.get_next_wealth(wealth_now,income_now,consume_now)
+            income_now = new_income_process[age-t]
+            consume_now = self.interpolate_consume(age,w)
+        
+        bequest = self.get_next_wealth(wealth_now,income_now,consume_now)
+
+        return bequest
+
+    def next_period_1st_cond(self,t_next,w_next):
+
+        # Calculate the RHS containing next-period state in FOC condition
+        # t_next: pperiod t+1
+        # w_next: wealth at period t+1
+        # new_income_process: income from t to the end 
+
+        consume_now = self.interpolate_consume(t_next,w_next)
+        bequest = self.approx_bequest(t_next,w_next,self.relative_income[t_next:])
+
+        u_prime_c = utility_1st_d(consume_now,risk_coef=self.risk_coef,type=self.utility_type)
+        u_prime_w = utility_1st_d(bequest,risk_coef=self.risk_coef,type=self.utility_type)
+
+        tmp_c = u_prime_c*self.discount_factor
+        tmp_w = u_prime_w*(1-self.discount_factor)*self.bequest_motive*self.interest_rate**(self.death_age+1-t_next)
+
+        return self.interest_rate*(tmp_c + tmp_w)
+    
+
+    def each_period_obj(self,c,t,w):
+
+        '''
+        Calculate FOC condition for each period t (except the final period)
+        The FOC condition: 
+            u'(c_t) = next_period_1st_cond(t_next,w_next,new_income_process)
+            w_next = R (w_t + y_t - c_t)
+
+        c: consumption at period t
+        w: wealth at period t
+        new_income_process: income from t to the end 
+        '''
+        
+        new_income_process = self.relative_income[t:]
+        t_next = t+1
+        w_next = self.get_next_wealth(wealth_now=w,income_now=new_income_process[0],consume_now=c)
+
+        tmp_now = utility_1st_d(c,risk_coef=self.risk_coef,type=self.utility_type)
+        tmp_next = self.next_period_1st_cond(t_next,w_next,new_income_process)
+
+        diff = tmp_now - tmp_next
+
+        return diff**0.1
+
+    
+    def consume_func_now(self,t):
+
+        # Solve optimal consumption for each wealth level at period t
+
+        new_income_process = self.relative_income[t:]
+
+        self.approx_consume_func[f'age_{t}'] = {'wealth':[],
+                                                'consumption':[]}
+        
+        w_grid = self.w_grid + max(0,self.consumption_floor/self.init_income - new_income_process[0])
+
+        for w in w_grid:
+            obj = lambda c:self.each_period_obj(c,t,w,new_income_process)
+            x0 = 1.0
+            bounds = [(self.consumption_floor/self.init_income, w+new_income_process[0])]
+
+            # solver = optimize.basinhopping(obj,x0,
+            #             minimizer_kwargs={'method':'COBYLA','bounds':bounds},
+            #             stepwise_factor = 0.5, T = 0.5)
             
+            solver = optimize.minimize(obj,x0,method='COBYLA',bounds=bounds)
+
+            if isinstance(solver.x, np.ndarray):
+                c = solver.x[0]
+            else:
+                c = solver.x
+           
+            self.approx_consume_func[f'age_{t}']['wealth'] += [w]
+            self.approx_consume_func[f'age_{t}']['consumption'] += [c]
+
+
+    def solve_consume_func(self,t_stop=0):
+
+        # Iteratively solve consumption function from the final period to t_stop
+
+        # solve the last period
+        self.solve_last_period()
+
+        # backward induction
+        for i in tqdm(range(1,self.death_age-t_stop+1)):
+            t = self.death_age - i
+            new_income_process = self.relative_income[t:]
+            self.consume_func_now(t,new_income_process)
+
+    
+    def gen_life_path(self):
+
+        # Generate wealth, consumption, income over the lifecycle
+
+        init_c = self.interpolate_consume(0,self.init_wealth/self.init_income)
+
+        self.life_path = {'wealth':[self.init_wealth/self.init_income],
+                          'consumption':[float(init_c)],
+                          'income':list(self.relatve_income)}
+        
+        for t in range(1,self.death_age+1):
+            w = self.interest_rate*(self.life_path['wealth'][-1] - self.life_path['consumption'][-1] + self.income_process[t-1])
+            c = self.interpolate_consume(t,w)
+            self.life_path['wealth'] += [w]
+            self.life_path['consumption'] += [float(c)]           
         
 
         
